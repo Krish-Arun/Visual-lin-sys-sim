@@ -254,6 +254,18 @@ section {
   accent-color: var(--accent);
 }
 
+.stats-footer {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .info-panel {
   background: var(--panel-2);
   border: 1px solid var(--border);

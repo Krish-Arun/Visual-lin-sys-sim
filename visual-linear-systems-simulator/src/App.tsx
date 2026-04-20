@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { MatrixInput } from "./components/MatrixInput";
 import { VectorInput } from "./components/VectorInput";
-import { InfoPanel } from "./components/InfoPanel";
 import { Canvas2D } from "./components/Canvas2D";
 import { useAnimation } from "./hooks/useAnimation";
 import type { Dim, Matrix, NamedVector, Operation, SubspaceToggles, Vec } from "./engine/types";
@@ -13,6 +12,7 @@ import {
   leftNullSpace,
   matVec,
   nullSpace,
+  rank as computeRank,
   rotationMatrix,
   rowSpace,
 } from "./engine/linalg";
@@ -63,6 +63,7 @@ function App() {
     row: false,
     leftNull: false,
   });
+  const [zoom, setZoom] = useState(1);
 
   const trailsRef = useRef<Record<string, Vec[]>>({});
 
@@ -107,10 +108,9 @@ function App() {
     () => (operation === "eigen" ? eigen(matrix) : null),
     [matrix, operation]
   );
-  const nullBasis = useMemo(
-    () => (operation === "rank" ? nullSpace(matrix) : []),
-    [matrix, operation]
-  );
+
+  const rankA = useMemo(() => computeRank(matrix), [matrix]);
+  const nullity = matrix.length - rankA;
 
   const subspaceBases = useMemo(() => {
     if (operation !== "subspaces") return null;
@@ -183,8 +183,6 @@ function App() {
             <option value="transform">Linear Transformation</option>
             <option value="iterate">Iterative Transformation (Aᵏv)</option>
             <option value="eigen">Eigenvectors &amp; Eigenvalues</option>
-            <option value="determinant">Determinant</option>
-            <option value="rank">Rank &amp; Null Space</option>
             <option value="subspaces">Fundamental Subspaces</option>
           </select>
           {operation === "subspaces" && (
@@ -277,10 +275,29 @@ function App() {
           <label className="check"><input type="checkbox" checked={showGrid} onChange={(e) => setShowGrid(e.target.checked)} /> Grid deformation</label>
           <label className="check"><input type="checkbox" checked={showBasis} onChange={(e) => setShowBasis(e.target.checked)} /> Basis vectors</label>
           <label className="check"><input type="checkbox" checked={showTrails} onChange={(e) => setShowTrails(e.target.checked)} /> Trails</label>
+          <div className="slider-row" style={{ marginTop: 6 }}>
+            <label>Zoom</label>
+            <input
+              type="range"
+              min={0.25}
+              max={4}
+              step={0.05}
+              value={zoom}
+              onChange={(e) => setZoom(parseFloat(e.target.value))}
+            />
+            <span className="muted">{zoom.toFixed(2)}×</span>
+          </div>
         </section>
 
-        <section>
-          <InfoPanel operation={operation} matrix={matrix} eigen={eigenResult} nullBasis={nullBasis} />
+        <section className="stats-footer">
+          <div className="info-row">
+            <span className="info-label">Rank(A)</span>
+            <span className="info-val">{rankA}</span>
+          </div>
+          <div className="info-row">
+            <span className="info-label">Nullity(A)</span>
+            <span className="info-val">{nullity}</span>
+          </div>
         </section>
 
         <footer className="footer muted">
@@ -300,10 +317,11 @@ function App() {
           showBasis={showBasis}
           showTrails={showTrails}
           eigen={eigenResult}
-          nullBasis={nullBasis}
           trails={trailsRef.current}
           subspaces={subspaces}
           subspaceBases={subspaceBases}
+          zoom={zoom}
+          onZoomChange={setZoom}
         />
       </main>
     </div>

@@ -7,8 +7,6 @@ export type Operation =
   | "transform"
   | "iterate"
   | "eigen"
-  | "determinant"
-  | "rank"
   | "subspaces";
 
 export interface NamedVector {

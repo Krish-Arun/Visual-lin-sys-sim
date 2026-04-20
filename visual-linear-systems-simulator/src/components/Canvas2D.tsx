@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Matrix, NamedVector, Vec, EigenResult, Operation, SubspaceToggles } from "../engine/types";
-import { identity, lerpVec, matMul, matVec, det as detFn } from "../engine/linalg";
+import { identity, lerpVec, matMul, matVec } from "../engine/linalg";
 import { easeCos } from "../hooks/useAnimation";
 
 interface SubspaceBases {
@@ -15,34 +15,29 @@ interface Props {
   matrix: Matrix;
   vectors: NamedVector[];
   operation: Operation;
-  t: number; // 0..1
-  step: number; // iteration step
+  t: number;
+  step: number;
   showGrid: boolean;
   showBasis: boolean;
   showTrails: boolean;
   eigen: EigenResult | null;
-  nullBasis: Vec[];
   trails: Record<string, Vec[]>;
   subspaces: SubspaceToggles;
   subspaceBases: SubspaceBases | null;
+  zoom: number;
+  onZoomChange: (z: number) => void;
 }
 
 const COLORS = {
   bg: "#0b0e14",
   grid: "rgba(77, 163, 255, 0.12)",
-  gridStrong: "rgba(77, 163, 255, 0.25)",
-  axis: "#4fc3ff",
-  axisGlow: "rgba(79, 195, 255, 0.45)",
+  axis: "rgba(79, 195, 255, 0.65)",
   deformedGrid: "#f2a23c",
   input: "#4fa3ff",
-  transformed: "#ff8a3d",
   basisX: "#ff4d4d",
   basisY: "#4ade80",
   basisZ: "#60a5fa",
   eigen: "#b57bff",
-  nullSpace: "#ff69b4",
-  unitShapeFill: "rgba(255, 138, 61, 0.15)",
-  unitShapeStroke: "#ff8a3d",
   text: "#d6e0f0",
   subCol: "#22e1ff",
   subNull: "#ff5fc8",
@@ -50,11 +45,14 @@ const COLORS = {
   subLeftNull: "#ffe15c",
 };
 
-// Isometric projection for 3D
+// Grid extent in world units. Axes clamp to this.
+const GRID_N = 6;
+const SUBSPACE_ALPHA_FILL = 0.16;
+const SUBSPACE_ALPHA_LINE = 0.9;
+
 const iso = (v: Vec): [number, number] => {
   if (v.length === 2) return [v[0], v[1]];
   const [x, y, z] = v;
-  // Classic isometric
   const cos30 = Math.cos(Math.PI / 6);
   const sin30 = Math.sin(Math.PI / 6);
   return [cos30 * (x - y), sin30 * (x + y) - z];
@@ -71,12 +69,29 @@ export const Canvas2D: React.FC<Props> = ({
   showBasis,
   showTrails,
   eigen,
-  nullBasis,
   trails,
   subspaces,
   subspaceBases,
+  zoom,
+  onZoomChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+
+  // Wheel handler — mount once
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      const next = Math.max(0.25, Math.min(4, zoomRef.current * factor));
+      onZoomChange(next);
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, [onZoomChange]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -94,8 +109,9 @@ export const Canvas2D: React.FC<Props> = ({
     canvas.style.height = `${h}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // World to screen
-    const scale = Math.min(w, h) / 12; // world unit -> px
+    // Single render-level scale that zoom modifies — no geometry recomputation.
+    const baseScale = Math.min(w, h) / 12;
+    const scale = baseScale * zoom;
     const cx = w / 2;
     const cy = h / 2;
     const toScreen = (v: Vec): [number, number] => {
@@ -103,17 +119,13 @@ export const Canvas2D: React.FC<Props> = ({
       return [cx + x * scale, cy - y * scale];
     };
 
-    // Fill background
     ctx.fillStyle = COLORS.bg;
     ctx.fillRect(0, 0, w, h);
 
     const eased = easeCos(t);
-    // Effective matrix: smoothly interpolate between I and A (for transform step)
-    // For iteration: between A^step and A^(step+1), animate once per step
     const n = dim;
     const I = identity(n);
 
-    // Determine the transformation path
     let fromM: Matrix = I;
     let toM: Matrix = matrix;
     if (operation === "iterate") {
@@ -121,65 +133,43 @@ export const Canvas2D: React.FC<Props> = ({
       for (let i = 0; i < step; i++) fromM = matMul(matrix, fromM);
       toM = matMul(matrix, fromM);
     }
-    // Interpolated matrix using entrywise lerp
     const M: Matrix = Array.from({ length: n }, (_, i) =>
       Array.from({ length: n }, (_, j) => (1 - eased) * fromM[i][j] + eased * toM[i][j])
     );
 
-    // Draw grid
-    if (showGrid) {
-      drawGrid(ctx, toScreen, dim, I, M);
-    }
+    // Layer 1: grid
+    if (showGrid) drawGrid(ctx, toScreen, dim, M);
 
-    // Draw neon-blue axes (on top of grid)
+    // Layer 2: axes (clamped to grid bounds, thin, subtle)
     drawAxes(ctx, toScreen, dim);
 
-    // Draw null space (rank mode)
-    if (operation === "rank" && nullBasis.length > 0) {
-      ctx.strokeStyle = COLORS.nullSpace;
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 4]);
-      for (const nv of nullBasis) {
-        const a = toScreen(scaleVecL(nv, -20));
-        const b = toScreen(scaleVecL(nv, 20));
-        ctx.beginPath();
-        ctx.moveTo(a[0], a[1]);
-        ctx.lineTo(b[0], b[1]);
-        ctx.stroke();
-      }
-      ctx.setLineDash([]);
-    }
-
-    // Fundamental subspaces mode
+    // Layer 3: subspaces (behind vectors)
     if (operation === "subspaces" && subspaceBases) {
-      if (subspaces.col) drawSubspace(ctx, toScreen, dim, subspaceBases.col, COLORS.subCol, "Col A");
-      if (subspaces.null) drawSubspace(ctx, toScreen, dim, subspaceBases.null, COLORS.subNull, "Nul A");
-      if (subspaces.row) drawSubspace(ctx, toScreen, dim, subspaceBases.row, COLORS.subRow, "Row A");
-      if (subspaces.leftNull)
-        drawSubspace(ctx, toScreen, dim, subspaceBases.leftNull, COLORS.subLeftNull, "Nul Aᵀ");
+      const list: [Vec[], string, string][] = [];
+      if (subspaces.col) list.push([subspaceBases.col, COLORS.subCol, "Col A"]);
+      if (subspaces.row) list.push([subspaceBases.row, COLORS.subRow, "Row A"]);
+      if (subspaces.null) list.push([subspaceBases.null, COLORS.subNull, "Nul A"]);
+      if (subspaces.leftNull) list.push([subspaceBases.leftNull, COLORS.subLeftNull, "Nul Aᵀ"]);
+      // Reduce clutter: when >=3 enabled, use a single label slot per subspace offset vertically
+      let labelSlot = 0;
+      for (const [basis, color, label] of list) {
+        drawSubspace(ctx, toScreen, dim, basis, color, label, labelSlot++);
+      }
     }
 
-    // Unit shape for determinant mode
-    if (operation === "determinant") {
-      drawUnitShape(ctx, toScreen, dim, M);
-      const dnow = (1 - eased) * detFn(fromM) + eased * detFn(toM);
-      ctx.fillStyle = COLORS.text;
-      ctx.font = "14px ui-monospace, monospace";
-      ctx.fillText(`det = ${dnow.toFixed(3)}`, 16, h - 16);
-    }
-
-    // Draw basis vectors
+    // Layer 4: basis vectors
     if (showBasis) {
       const basisColors = [COLORS.basisX, COLORS.basisY, COLORS.basisZ];
+      const origin = Array(n).fill(0) as Vec;
       for (let i = 0; i < n; i++) {
         const e = Array(n).fill(0);
         e[i] = 1;
         const Me = matVec(M, e);
-        drawArrow(ctx, toScreen([0, 0, 0].slice(0, n) as Vec), toScreen(Me), basisColors[i], 2);
+        drawArrow(ctx, toScreen(origin), toScreen(Me), basisColors[i], 2);
       }
     }
 
-    // Draw trails
+    // Layer 5: trails
     if (showTrails && operation === "iterate") {
       for (const v of vectors) {
         const tr = trails[v.id] ?? [];
@@ -199,7 +189,7 @@ export const Canvas2D: React.FC<Props> = ({
       }
     }
 
-    // Draw eigen vectors
+    // Layer 6: eigen visualization
     if (operation === "eigen" && eigen) {
       for (let i = 0; i < eigen.vectors.length; i++) {
         const ev = eigen.vectors[i];
@@ -214,35 +204,34 @@ export const Canvas2D: React.FC<Props> = ({
         ctx.lineTo(b[0], b[1]);
         ctx.stroke();
         ctx.setLineDash([]);
-        // Draw scaled eigen arrow showing Av = λv
         const lambda = eigen.values[i].re;
         const targetEnd = scaleVecL(ev, lambda);
         const animatedEnd = lerpVec(ev, targetEnd, eased);
-        drawArrow(ctx, toScreen([0, 0, 0].slice(0, n) as Vec), toScreen(animatedEnd), COLORS.eigen, 2.5);
+        const origin = Array(n).fill(0) as Vec;
+        drawArrow(ctx, toScreen(origin), toScreen(animatedEnd), COLORS.eigen, 2.5);
       }
     }
 
-    // Draw input and transformed vectors
+    // Layer 7: input + transformed vectors (always on top)
     for (const v of vectors) {
       const Mv = matVec(M, v.components);
-      // Input vector (ghost) at original position
-      if (operation === "transform" || operation === "determinant") {
+      const origin = Array(n).fill(0) as Vec;
+      if (operation === "transform") {
         drawArrow(
           ctx,
-          toScreen([0, 0, 0].slice(0, n) as Vec),
+          toScreen(origin),
           toScreen(v.components),
           hexWithAlpha(COLORS.input, 0.35),
           2
         );
       }
-      drawArrow(ctx, toScreen([0, 0, 0].slice(0, n) as Vec), toScreen(Mv), v.color, 3);
+      drawArrow(ctx, toScreen(origin), toScreen(Mv), v.color, 3);
       if (v.name) {
         const [tx, ty] = toScreen(Mv);
-        const [ox, oy] = toScreen([0, 0, 0].slice(0, n) as Vec);
+        const [ox, oy] = toScreen(origin);
         const dx = tx - ox;
         const dy = ty - oy;
         const len = Math.hypot(dx, dy) || 1;
-        // offset label away from arrow tip, perpendicular + along direction
         const nx = -dy / len;
         const ny = dx / len;
         const lx = tx + (dx / len) * 10 + nx * 6;
@@ -261,9 +250,14 @@ export const Canvas2D: React.FC<Props> = ({
       ctx.fillText(`k = ${step + (t > 0 ? t : 0).toFixed(2).slice(1)}`, 16, 24);
       ctx.fillText(`step ${step} → ${step + 1}`, 16, 42);
     }
-  }, [dim, matrix, vectors, operation, t, step, showGrid, showBasis, showTrails, eigen, nullBasis, trails]);
+    if (zoom !== 1) {
+      ctx.globalAlpha = 0.6;
+      ctx.fillText(`zoom ${zoom.toFixed(2)}×`, w - 90, h - 14);
+      ctx.globalAlpha = 1;
+    }
+  }, [dim, matrix, vectors, operation, t, step, showGrid, showBasis, showTrails, eigen, trails, subspaces, subspaceBases, zoom]);
 
-  return <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />;
+  return <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block", cursor: "grab" }} />;
 };
 
 const scaleVecL = (v: Vec, s: number): Vec => v.map((x) => x * s);
@@ -315,31 +309,11 @@ const drawAxes = (
   toScreen: (v: Vec) => [number, number],
   dim: 2 | 3
 ) => {
-  const N = 8;
+  const N = GRID_N;
   ctx.save();
-  // Draw a wide faint line first to simulate glow (cheaper than shadowBlur)
-  ctx.strokeStyle = COLORS.axisGlow;
-  ctx.globalAlpha = 1;
-  ctx.lineWidth = 6;
-  const drawLineGlow = (a: Vec, b: Vec) => {
-    const [x1, y1] = toScreen(a);
-    const [x2, y2] = toScreen(b);
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-  };
-  if (dim === 2) {
-    drawLineGlow([-N, 0], [N, 0]);
-    drawLineGlow([0, -N], [0, N]);
-  } else {
-    drawLineGlow([-N, 0, 0], [N, 0, 0]);
-    drawLineGlow([0, -N, 0], [0, N, 0]);
-    drawLineGlow([0, 0, -N], [0, 0, N]);
-  }
   ctx.strokeStyle = COLORS.axis;
-  ctx.globalAlpha = 0.9;
-  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1.2;
   const drawLine = (a: Vec, b: Vec) => {
     const [x1, y1] = toScreen(a);
     const [x2, y2] = toScreen(b);
@@ -348,34 +322,30 @@ const drawAxes = (
     ctx.lineTo(x2, y2);
     ctx.stroke();
   };
-  if (dim === 2) {
-    drawLine([-N, 0], [N, 0]);
-    drawLine([0, -N], [0, N]);
-  } else {
-    drawLine([-N, 0, 0], [N, 0, 0]);
-    drawLine([0, -N, 0], [0, N, 0]);
-    drawLine([0, 0, -N], [0, 0, N]);
-  }
+  const axesEndpoints: [Vec, Vec, string][] = dim === 2
+    ? [
+        [[-N, 0], [N, 0], "x"],
+        [[0, -N], [0, N], "y"],
+      ]
+    : [
+        [[-N, 0, 0], [N, 0, 0], "x"],
+        [[0, -N, 0], [0, N, 0], "y"],
+        [[0, 0, -N], [0, 0, N], "z"],
+      ];
+  for (const [a, b] of axesEndpoints) drawLine(a, b);
   ctx.restore();
 
-  // Axis labels (no glow, crisp)
+  // Labels: offset ABOVE axis in screen space, small gap
   ctx.save();
-  ctx.fillStyle = COLORS.axis;
-  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = "#8ed4ff";
+  ctx.globalAlpha = 0.95;
   ctx.font = "600 12px ui-monospace, monospace";
   ctx.textBaseline = "middle";
-  if (dim === 2) {
-    const [xx, xy] = toScreen([N - 0.3, 0]);
-    ctx.fillText("x", xx + 4, xy);
-    const [yx, yy] = toScreen([0, N - 0.3]);
-    ctx.fillText("y", yx + 4, yy);
-  } else {
-    const [xx, xy] = toScreen([N - 0.3, 0, 0]);
-    ctx.fillText("x", xx + 4, xy);
-    const [yx, yy] = toScreen([0, N - 0.3, 0]);
-    ctx.fillText("y", yx + 4, yy);
-    const [zx, zy] = toScreen([0, 0, N - 0.3]);
-    ctx.fillText("z", zx + 4, zy);
+  ctx.textAlign = "center";
+  const LABEL_OFFSET_Y = -12; // screen px above the axis line
+  for (const [, endpoint, label] of axesEndpoints) {
+    const [lx, ly] = toScreen(endpoint);
+    ctx.fillText(label, lx, ly + LABEL_OFFSET_Y);
   }
   ctx.restore();
 };
@@ -386,30 +356,25 @@ const drawSubspace = (
   dim: 2 | 3,
   basis: Vec[],
   color: string,
-  label: string
+  label: string,
+  labelSlot: number
 ) => {
   if (basis.length === 0) return;
   ctx.save();
-  ctx.strokeStyle = color;
-  ctx.fillStyle = hexToRGBA(color, 0.18);
-  ctx.lineWidth = 2;
   if (basis.length === 1) {
-    // Line through origin along basis[0]
     const v = basis[0];
-    const s = 20;
+    const s = GRID_N + 2; // stay near grid extents
     const a = toScreen(v.map((x) => x * -s));
     const b = toScreen(v.map((x) => x * s));
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = SUBSPACE_ALPHA_LINE;
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(a[0], a[1]);
     ctx.lineTo(b[0], b[1]);
     ctx.stroke();
-    const tip = toScreen(v.map((x) => x * 4));
-    ctx.fillStyle = color;
-    ctx.font = "600 12px ui-monospace, monospace";
-    ctx.fillText(label, tip[0] + 6, tip[1]);
   } else if (basis.length === 2) {
-    // Plane as parallelogram: from -s*(u+v) to s*(u+v) with 4 corners
-    const s = 5;
+    const s = GRID_N - 1;
     const u = basis[0];
     const v = basis[1];
     const c1 = u.map((a, i) => s * a + s * v[i]);
@@ -421,30 +386,32 @@ const drawSubspace = (
     ctx.moveTo(pts[0][0], pts[0][1]);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
     ctx.closePath();
-    ctx.fillStyle = hexToRGBA(color, 0.18);
+    ctx.fillStyle = hexToRGBA(color, SUBSPACE_ALPHA_FILL);
     ctx.fill();
+    ctx.strokeStyle = hexToRGBA(color, SUBSPACE_ALPHA_LINE);
+    ctx.lineWidth = 1.5;
     ctx.stroke();
-    // label near center of first edge
-    const mid = toScreen(u.map((a, i) => 3 * a + v[i]));
-    ctx.fillStyle = color;
-    ctx.font = "600 12px ui-monospace, monospace";
-    ctx.fillText(label, mid[0] + 6, mid[1]);
   } else {
-    // Full space (rank n) — draw an axis-cross marker
+    // Full space — faint wash, no overlap
     if (dim === 2) {
-      // whole plane — light wash
-      ctx.globalAlpha = 0.1;
+      ctx.globalAlpha = 0.06;
       ctx.fillStyle = color;
-      const [x1, y1] = toScreen([-20, -20]);
-      const [x2, y2] = toScreen([20, 20]);
+      const [x1, y1] = toScreen([-GRID_N, -GRID_N]);
+      const [x2, y2] = toScreen([GRID_N, GRID_N]);
       ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
     }
-    const [lx, ly] = toScreen(dim === 2 ? [0.5, 0.5] : [0.5, 0.5, 0.5]);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = color;
-    ctx.font = "600 12px ui-monospace, monospace";
-    ctx.fillText(`${label} (full)`, lx, ly);
   }
+  ctx.restore();
+
+  // Legend label: stacked in top-left corner to avoid clutter
+  ctx.save();
+  ctx.fillStyle = hexToRGBA(color, 0.18);
+  ctx.fillRect(12, 60 + labelSlot * 22, 92, 18);
+  ctx.fillStyle = color;
+  ctx.font = "600 11px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.fillText(label, 18, 60 + labelSlot * 22 + 9);
   ctx.restore();
 };
 
@@ -462,11 +429,9 @@ const drawGrid = (
   ctx: CanvasRenderingContext2D,
   toScreen: (v: Vec) => [number, number],
   dim: 2 | 3,
-  _I: Matrix,
   M: Matrix
 ) => {
-  const N = 6;
-  // Original faded grid
+  const N = GRID_N;
   ctx.strokeStyle = COLORS.grid;
   ctx.lineWidth = 1;
   if (dim === 2) {
@@ -485,7 +450,6 @@ const drawGrid = (
       ctx.stroke();
     }
   } else {
-    // 3D grid on z=0 plane (and axes)
     for (let i = -N; i <= N; i++) {
       const a = toScreen([i, -N, 0]);
       const b = toScreen([i, N, 0]);
@@ -504,7 +468,7 @@ const drawGrid = (
 
   // Deformed grid
   ctx.strokeStyle = COLORS.deformedGrid;
-  ctx.globalAlpha = 0.6;
+  ctx.globalAlpha = 0.55;
   ctx.lineWidth = 1;
   if (dim === 2) {
     for (let i = -N; i <= N; i++) {
@@ -546,67 +510,4 @@ const drawGrid = (
     }
   }
   ctx.globalAlpha = 1;
-};
-
-const drawUnitShape = (
-  ctx: CanvasRenderingContext2D,
-  toScreen: (v: Vec) => [number, number],
-  dim: 2 | 3,
-  M: Matrix
-) => {
-  ctx.strokeStyle = COLORS.unitShapeStroke;
-  ctx.fillStyle = COLORS.unitShapeFill;
-  ctx.lineWidth = 2;
-  if (dim === 2) {
-    const corners: Vec[] = [[0, 0], [1, 0], [1, 1], [0, 1]];
-    ctx.beginPath();
-    for (let i = 0; i < corners.length; i++) {
-      const [x, y] = toScreen(matVec(M, corners[i]));
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  } else {
-    const cs: Vec[] = [
-      [0, 0, 0],
-      [1, 0, 0],
-      [1, 1, 0],
-      [0, 1, 0],
-      [0, 0, 1],
-      [1, 0, 1],
-      [1, 1, 1],
-      [0, 1, 1],
-    ];
-    const edges = [
-      [0, 1], [1, 2], [2, 3], [3, 0],
-      [4, 5], [5, 6], [6, 7], [7, 4],
-      [0, 4], [1, 5], [2, 6], [3, 7],
-    ];
-    const transformed = cs.map((c) => matVec(M, c));
-    // Fill bottom face
-    const faces = [
-      [0, 1, 2, 3],
-      [4, 5, 6, 7],
-    ];
-    for (const face of faces) {
-      ctx.beginPath();
-      for (let i = 0; i < face.length; i++) {
-        const [x, y] = toScreen(transformed[face[i]]);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.closePath();
-      ctx.fill();
-    }
-    for (const [a, b] of edges) {
-      const [x1, y1] = toScreen(transformed[a]);
-      const [x2, y2] = toScreen(transformed[b]);
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
-    }
-  }
 };
